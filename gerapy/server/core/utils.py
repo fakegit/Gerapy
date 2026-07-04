@@ -9,17 +9,21 @@ from jinja2 import Template
 from scrapyd_api import ScrapydAPI
 from bs4 import BeautifulSoup
 import traceback
-import json, os, string
+import json
+import os
+import string
 from shutil import move, copy, rmtree
 from os.path import join, exists, dirname
+from urllib.parse import urlparse
+import socket
+import ipaddress
 from django.utils import timezone
-
 from gerapy import get_logger
 from gerapy.settings import PROJECTS_FOLDER
 
-logger = get_logger(__name__)
 
-IGNORES = ['.git/', '*.pyc', '.DS_Store', '.idea/', '*.egg', '*.egg-info/', '*.egg-info', 'build/']
+IGNORES = ['.git/', '*.pyc', '.DS_Store', '.idea/',
+           '*.egg', '*.egg-info/', '*.egg-info', 'build/']
 
 TEMPLATES_DIR = join(dirname(dirname(dirname(abspath(__file__)))), 'templates')
 
@@ -33,6 +37,39 @@ TEMPLATES_TO_RENDER = (
 
 NO_REFERRER = '<meta name="referrer" content="never">'
 BASE = '<base href="{href}">'
+
+
+def is_safe_url(url):
+    """
+    Validate a user-supplied URL before fetching it server-side, to mitigate
+    SSRF (server-side request forgery). Only http/https URLs are allowed and the
+    target host must not resolve to a private, loopback, link-local, reserved or
+    otherwise non-global address (e.g. cloud metadata endpoints, localhost).
+    :param url: the URL to validate
+    :return: True if the URL is safe to fetch, otherwise False
+    """
+    try:
+        parsed = urlparse(url)
+    except (ValueError, AttributeError):
+        return False
+    if parsed.scheme not in ('http', 'https'):
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None)
+    except (socket.gaierror, UnicodeError):
+        return False
+    for addr_info in addr_infos:
+        ip = addr_info[4][0]
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        if not ip_obj.is_global:
+            return False
+    return True
 
 
 def get_scrapyd(client):
@@ -92,6 +129,7 @@ def is_valid_name(project_name):
     :param project_name:
     :return:
     """
+    logger = get_logger(__name__)
     if not re.search(r'^[_a-zA-Z]\w*$', project_name):
         logger.error('project name %s must begin with a letter and contain only letters, numbers and underscores',
                      project_name)
@@ -111,11 +149,11 @@ def copy_tree(src, dst):
     ignored_names = ignore(src, names)
     if not os.path.exists(dst):
         os.makedirs(dst)
-    
+
     for name in names:
         if name in ignored_names:
             continue
-        
+
         src_name = os.path.join(src, name)
         dst_name = os.path.join(dst, name)
         if os.path.isdir(src_name):
@@ -230,7 +268,8 @@ def process_html(html, base_url):
     """
     dom = BeautifulSoup(html, 'lxml')
     dom.find('head').insert(0, BeautifulSoup(NO_REFERRER, 'lxml'))
-    dom.find('head').insert(0, BeautifulSoup(BASE.format(href=base_url), 'lxml'))
+    dom.find('head').insert(0, BeautifulSoup(
+        BASE.format(href=base_url), 'lxml'))
     html = str(dom)
     # html = unescape(html)
     return html
@@ -248,7 +287,8 @@ def get_output_error(project_name, spider_name):
     try:
         os.chdir(project_path)
         cmd = ' '.join(['scrapy', 'crawl', spider_name])
-        p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
+        p = Popen(cmd, shell=False, stdin=PIPE, stdout=PIPE,
+                  stderr=STDOUT, close_fds=True)
         output = p.stdout.read()
         if isinstance(output, bytes):
             output = output.decode('utf-8')
@@ -268,7 +308,8 @@ def get_items_configuration(configuration):
     spiders = configuration.get('spiders')
     for spider in spiders:
         # MongoDB
-        mongodb_collection_map = spider.get('storage').get('mongodb').get('collections')
+        mongodb_collection_map = spider.get(
+            'storage').get('mongodb').get('collections')
         for mongodb_collection_map_item in mongodb_collection_map:
             collection = mongodb_collection_map_item.get('collection')
             item_name = mongodb_collection_map_item.get('item')
@@ -276,10 +317,11 @@ def get_items_configuration(configuration):
                 if item.get('name') == item_name:
                     allowed_spiders = item.get('mongodb_spiders', set())
                     allowed_spiders.add(spider.get('name'))
-                    mongodb_collections = item.get('mongodb_collections', set())
+                    mongodb_collections = item.get(
+                        'mongodb_collections', set())
                     mongodb_collections.add(collection)
                     item['mongodb_spiders'], item['mongodb_collections'] = allowed_spiders, mongodb_collections
-        
+
         # MySQL
         mysql_table_map = spider.get('storage').get('mysql').get('tables')
         for mysql_table_map_item in mysql_table_map:
@@ -293,7 +335,8 @@ def get_items_configuration(configuration):
                     mysql_tables.add(collection)
                     item['mysql_spiders'], item['mysql_tables'] = allowed_spiders, mysql_tables
     # transfer attr
-    attrs = ['mongodb_spiders', 'mongodb_collections', 'mysql_spiders', 'mysql_tables']
+    attrs = ['mongodb_spiders', 'mongodb_collections',
+             'mysql_spiders', 'mysql_tables']
     for item in items:
         for attr in attrs:
             if item.get(attr):
@@ -308,7 +351,7 @@ def process_custom_settings(spider):
     :return:
     """
     custom_settings = spider.get('custom_settings')
-    
+
     def add_dict_to_custom_settings(custom_settings, keys):
         """
         if config doesn't exist, add default value
@@ -326,17 +369,19 @@ def process_custom_settings(spider):
                     'value': '{}'
                 })
         return custom_settings
-    
+
     keys = ['DOWNLOADER_MIDDLEWARES', 'SPIDER_MIDDLEWARES', 'ITEM_PIPELINES']
     custom_settings = add_dict_to_custom_settings(custom_settings, keys)
     for item in custom_settings:
-        
+
         if item['key'] == 'DOWNLOADER_MIDDLEWARES':
             item_data = json.loads(item['value'])
-            if spider.get('cookies', {}).get('enable', {}): item_data[
-                'gerapy.downloadermiddlewares.cookies.CookiesMiddleware'] = 554
-            if spider.get('proxy', {}).get('enable', {}): item_data[
-                'gerapy.downloadermiddlewares.proxy.ProxyMiddleware'] = 555
+            if spider.get('cookies', {}).get('enable', {}):
+                item_data[
+                    'gerapy.downloadermiddlewares.cookies.CookiesMiddleware'] = 554
+            if spider.get('proxy', {}).get('enable', {}):
+                item_data[
+                    'gerapy.downloadermiddlewares.proxy.ProxyMiddleware'] = 555
             item_data['gerapy.downloadermiddlewares.pyppeteer.PyppeteerMiddleware'] = 601
             item_data['scrapy_splash.SplashCookiesMiddleware'] = 723
             item_data['scrapy_splash.SplashMiddleware'] = 725
@@ -348,10 +393,12 @@ def process_custom_settings(spider):
             item['value'] = json.dumps(item_data)
         if item['key'] == 'ITEM_PIPELINES':
             item_data = json.loads(item['value'])
-            if spider.get('storage', {}).get('mysql', {}).get('enable', {}): item_data[
-                'gerapy.pipelines.MySQLPipeline'] = 300
-            if spider.get('storage', {}).get('mongodb', {}).get('enable', {}): item_data[
-                'gerapy.pipelines.MongoDBPipeline'] = 301
+            if spider.get('storage', {}).get('mysql', {}).get('enable', {}):
+                item_data[
+                    'gerapy.pipelines.MySQLPipeline'] = 300
+            if spider.get('storage', {}).get('mongodb', {}).get('enable', {}):
+                item_data[
+                    'gerapy.pipelines.MongoDBPipeline'] = 301
             item['value'] = json.dumps(item_data)
     return spider
 
@@ -372,7 +419,8 @@ def generate_project(project_name):
         rmtree(project_dir)
     # generate project
     copy_tree(join(TEMPLATES_DIR, 'project'), project_dir)
-    move(join(PROJECTS_FOLDER, project_name, 'module'), join(project_dir, project_name))
+    move(join(PROJECTS_FOLDER, project_name, 'module'),
+         join(project_dir, project_name))
     for paths in TEMPLATES_TO_RENDER:
         path = join(*paths)
         tplfile = join(project_dir,
@@ -388,10 +436,13 @@ def generate_project(project_name):
     for spider in spiders:
         spider = process_custom_settings(spider)
         source_tpl_file = join(TEMPLATES_DIR, 'spiders', 'crawl.tmpl')
-        new_tpl_file = join(PROJECTS_FOLDER, project_name, project_name, 'spiders', 'crawl.tmpl')
-        spider_file = "%s.py" % join(PROJECTS_FOLDER, project_name, project_name, 'spiders', spider.get('name'))
+        new_tpl_file = join(PROJECTS_FOLDER, project_name,
+                            project_name, 'spiders', 'crawl.tmpl')
+        spider_file = "%s.py" % join(
+            PROJECTS_FOLDER, project_name, project_name, 'spiders', spider.get('name'))
         copy(source_tpl_file, new_tpl_file)
-        render_template(new_tpl_file, spider_file, spider=spider, project_name=project_name)
+        render_template(new_tpl_file, spider_file,
+                        spider=spider, project_name=project_name)
     # save generated_at attr
     model = Project.objects.get(name=project_name)
     model.generated_at = timezone.now()
@@ -433,7 +484,10 @@ def get_job_id(client, task):
     :param task: task object
     :return: job id
     """
-    return '%s-%s-%s' % (client.name, task.project, task.spider)
+    # include the client's primary key so that clients sharing the same name do
+    # not collide on the same job id (which, with replace_existing=True, would
+    # cause some selected hosts to silently not be scheduled)
+    return '%s-%s-%s-%s' % (client.id, client.name, task.project, task.spider)
 
 
 def load_dict(x, transformer=None):
@@ -447,7 +501,7 @@ def load_dict(x, transformer=None):
     try:
         data = json.loads(x)
         if not transformer:
-            transformer = lambda x: x
+            def transformer(x): return x
         data = {k: transformer(v) for k, v in data.items()}
         return data
     except:
@@ -465,7 +519,7 @@ def str2list(x, transformer=None):
     try:
         data = json.loads(x)
         if not transformer:
-            transformer = lambda x: x
+            def transformer(x): return x
         data = list(map(lambda x: transformer(x), data))
         return data
     except:
@@ -532,3 +586,34 @@ def str2str(v):
     if v.lower() in ('none', 'null', 'undefined', 'nil', 'false'):
         return None
     return str(v)
+
+
+def log_exception(exception=Exception, logger=None):
+    """
+    used for log exceptions
+    """
+    if not logger:
+        logger = get_logger(__name__)
+
+    def deco(func):
+        def wrapper(*args, **kwargs):
+            try:
+                result = func(*args, **kwargs)
+            except exception as err:
+                logger.exception(err, exc_info=True)
+            else:
+                return result
+        return wrapper
+    return deco
+
+
+def is_in_curdir(filepath):
+    """
+    return if a filepath in cur directory
+    """
+    execute_path = os.getcwd()
+    print('ecec', execute_path, filepath)
+    result = os.path.realpath(filepath).startswith(
+        os.path.realpath(execute_path))
+    print('result', result)
+    return result
